@@ -78,6 +78,7 @@ Same binary, different `TRACE_FILTER`.
 | variable | default | notes |
 |---|---|---|
 | `LOG_FORMAT` | `line` | `line`, `pretty` (multi-line with span stack), `json` |
+| `LOG_COLOR` | `auto` | `auto` = colour on a TTY (respects `NO_COLOR`), `always`, `never`; dev forces it on for `podman logs` |
 | `LOG_FILTER` / `RUST_LOG` | `info` | `EnvFilter` syntax |
 | `TRACE_FILTER` | = `LOG_FILTER` | exporter internals (`hyper`, `h2`, `opentelemetry*`, …) are always excluded to avoid feedback loops |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset = no export | standard OTel SDK vars apply (`OTEL_BSP_*`, `OTEL_METRIC_EXPORT_INTERVAL`, …) |

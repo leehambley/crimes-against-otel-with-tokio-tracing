@@ -90,9 +90,8 @@ impl Telemetry {
         let (trace_filter, trace_handle) =
             reload::Layer::new(filter::trace_filter(&config.trace_filter)?);
 
-        // Colour only when a human is watching; container logs stay clean.
-        let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
-        let fmt = tracing_subscriber::fmt::layer().with_ansi(ansi);
+        // LOG_COLOR: auto = colour only on a TTY.
+        let fmt = tracing_subscriber::fmt::layer().with_ansi(config.log_color);
         let fmt_layer: BoxedLayer = match config.log_format {
             LogFormat::Line => fmt.event_format(format::Line).boxed(),
             LogFormat::Pretty => fmt.pretty().boxed(),

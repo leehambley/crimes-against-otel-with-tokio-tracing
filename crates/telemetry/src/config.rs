@@ -35,6 +35,7 @@ impl std::str::FromStr for LogFormat {
 /// | `LOG_FILTER` (or `RUST_LOG`)   | `info`                   |
 /// | `TRACE_FILTER`                 | same as `LOG_FILTER`     |
 /// | `OTEL_EXPORTER_OTLP_ENDPOINT`  | unset = don't export     |
+/// | `LOG_COLOR`                    | `auto` (colour on a TTY) |
 /// | `CONTROL_SOCKET`               | `/tmp/<service>.ctl`     |
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -44,6 +45,9 @@ pub struct Config {
     pub log_filter: String,
     pub trace_filter: String,
     pub otlp_enabled: bool,
+    /// `auto`: colour when stdout is a terminal. `always` is for viewers
+    /// that render ANSI but aren't a TTY themselves, like `podman logs`.
+    pub log_color: bool,
     pub control_socket: Option<PathBuf>,
 }
 
@@ -65,7 +69,17 @@ impl Config {
             None => Some(env::temp_dir().join(format!("{service_name}.ctl"))),
         };
 
+        let log_color = match var("LOG_COLOR").as_deref() {
+            Some("always") => true,
+            Some("never") => false,
+            Some("auto") | None => {
+                var("NO_COLOR").is_none() && std::io::IsTerminal::is_terminal(&std::io::stdout())
+            }
+            Some(other) => panic!("unknown LOG_COLOR {other:?} (auto|always|never)"),
+        };
+
         Self {
+            log_color,
             environment: var("DEPLOY_ENV").unwrap_or_else(|| "dev".to_owned()),
             otlp_enabled: var("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
                 || var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_some(),
