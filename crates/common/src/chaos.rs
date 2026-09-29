@@ -25,9 +25,16 @@ use tracing::Instrument as _;
 pub struct ChaosError {
     pub operation: &'static str,
     pub kind: &'static str,
+    /// Low-cardinality `error.type`, as a real client would report it.
+    pub error_type: &'static str,
 }
 
-const FAILURE_KINDS: &[&str] = &["connection reset by peer", "timed out", "READONLY replica"];
+/// (message, `error.type`)
+const FAILURE_KINDS: &[(&str, &str)] = &[
+    ("connection reset by peer", "ECONNRESET"),
+    ("timed out", "timeout"),
+    ("READONLY replica", "READONLY"),
+];
 
 #[derive(Default)]
 pub struct Chaos {
@@ -118,15 +125,19 @@ impl Chaos {
                 .instrument(tracing::info_span!(
                     "chaos.latency",
                     operation,
-                    delay_ms = ms
+                    delay_ms = ms as i64
                 ))
                 .await;
-            tracing::warn!(operation, delay_ms = ms, "injected latency");
+            tracing::warn!(operation, delay_ms = ms as i64, "injected latency");
         }
         if rand::random_bool(self.failure_pct() / 100.0) {
-            let kind = FAILURE_KINDS[rand::random_range(0..FAILURE_KINDS.len())];
+            let (kind, error_type) = FAILURE_KINDS[rand::random_range(0..FAILURE_KINDS.len())];
             tracing::event!(target: "metrics", tracing::Level::TRACE, monotonic_counter.chaos_injected = 1u64, kind = "failure", operation = operation);
-            return Err(ChaosError { operation, kind });
+            return Err(ChaosError {
+                operation,
+                kind,
+                error_type,
+            });
         }
         Ok(())
     }

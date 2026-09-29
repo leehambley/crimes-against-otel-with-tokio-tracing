@@ -1,4 +1,9 @@
-//! W3C `traceparent` propagation for inbound (axum) and outbound (reqwest)
+//! Integer fields are recorded as `i64`: tracing-opentelemetry has no
+//! `record_u64`, so `u16`/`u64` values would be exported as *strings*, which
+//! breaks semconv (`http.response.status_code` is an int) and numeric
+//! comparisons in the collector's sampling rules.
+//!
+//! W3C `traceparent` + `baggage` propagation for inbound (axum) and outbound (reqwest)
 //! HTTP, and the server/client spans around them.
 
 use std::time::Instant;
@@ -45,8 +50,8 @@ pub fn trace_id(span: &Span) -> String {
 }
 
 /// axum middleware (install with `Router::route_layer` so `MatchedPath` is
-/// known): continues the caller's trace, opens the `http.server.request`
-/// span, and records the outcome on it.
+/// known): continues the caller's trace, opens the server span named
+/// `{method} {http.route}`, and records the outcome with semconv attributes.
 pub async fn server_span(request: Request, next: Next) -> Response {
     let parent = extract(request.headers());
     let method = request.method().clone();
@@ -55,6 +60,15 @@ pub async fn server_span(request: Request, next: Next) -> Response {
         .get::<MatchedPath>()
         .map(|p| p.as_str().to_owned())
         .unwrap_or_else(|| request.uri().path().to_owned());
+    let host = request
+        .headers()
+        .get(http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    let (address, port) = match host.rsplit_once(':') {
+        Some((a, p)) => (a, p.parse::<u16>().ok()),
+        None => (host, None),
+    };
 
     let span = tracing::info_span!(
         "http.server.request",
@@ -64,7 +78,16 @@ pub async fn server_span(request: Request, next: Next) -> Response {
         http.request.method = %method,
         http.route = %route,
         url.path = %request.uri().path(),
+        url.scheme = "http",
+        server.address = address,
+        server.port = port.map(i64::from),
+        network.protocol.version = protocol_version(request.version()),
+        user_agent.original = request
+            .headers()
+            .get(http::header::USER_AGENT)
+            .and_then(|h| h.to_str().ok()),
         http.response.status_code = Empty,
+        error.type = Empty,
         trace_id = Empty,
     );
     // Must happen before anything starts the span (entering it, or context()).
@@ -81,32 +104,48 @@ pub async fn server_span(request: Request, next: Next) -> Response {
         .await;
 
     let status = response.status();
-    span.record("http.response.status_code", status.as_u16());
+    span.record("http.response.status_code", i64::from(status.as_u16()));
+    // Semconv: for server spans only 5xx is an error; 4xx is the caller's fault.
     if status.is_server_error() {
         span.record("otel.status_code", "ERROR");
+        span.record("error.type", status.as_str());
     }
     let elapsed_ms = (started.elapsed().as_secs_f64() * 1e6).round() / 1e3;
-    span.in_scope(|| tracing::info!(status = status.as_u16(), elapsed_ms, "request completed"));
+    span.in_scope(|| {
+        tracing::info!(
+            status = i64::from(status.as_u16()),
+            elapsed_ms,
+            "request completed"
+        )
+    });
     response
 }
 
-/// Sends `request` inside an `http.client.request` span, propagating the
-/// span's context in `traceparent`. `peer` names the downstream service.
+/// Sends `request` inside a client span named `{method} {url_template}`,
+/// propagating the span's context in `traceparent`/`baggage`. `url_template`
+/// is the low-cardinality path, e.g. `/items/{key}`.
 pub async fn send(
     client: &reqwest::Client,
     mut request: reqwest::Request,
-    peer: &'static str,
+    url_template: &'static str,
 ) -> reqwest::Result<reqwest::Response> {
     let method = request.method().clone();
+    let url = request.url();
+    let peer = url.host_str().unwrap_or_default().to_owned();
     let span = tracing::info_span!(
         "http.client.request",
-        otel.name = %format!("{method} {peer}"),
+        otel.name = %format!("{method} {url_template}"),
         otel.kind = "client",
         otel.status_code = Empty,
-        peer.service = peer,
         http.request.method = %method,
-        url.full = %request.url(),
+        url.full = %url,
+        url.scheme = url.scheme(),
+        url.template = url_template,
+        server.address = %peer,
+        server.port = url.port_or_known_default().map(i64::from),
+        network.protocol.version = Empty,
         http.response.status_code = Empty,
+        error.type = Empty,
     );
     inject(&context_of(&span), request.headers_mut());
 
@@ -116,20 +155,61 @@ pub async fn send(
         match &result {
             Ok(response) => {
                 let status = response.status();
-                span.record("http.response.status_code", status.as_u16());
-                if status.is_server_error() {
+                span.record("http.response.status_code", i64::from(status.as_u16()));
+                span.record(
+                    "network.protocol.version",
+                    protocol_version(response.version()),
+                );
+                // Semconv: for client spans both 4xx and 5xx are errors. The
+                // collector's sampler ignores client-side 4xx (see
+                // deploy/otel-collector.yaml) so 404s don't force-keep traces.
+                if status.is_client_error() || status.is_server_error() {
                     span.record("otel.status_code", "ERROR");
-                    tracing::warn!(status = status.as_u16(), "{peer} returned a server error");
+                    span.record("error.type", status.as_str());
+                }
+                if status.is_server_error() {
+                    tracing::warn!(
+                        status = i64::from(status.as_u16()),
+                        "{peer} returned a server error"
+                    );
                 } else {
-                    tracing::debug!(status = status.as_u16(), "{peer} responded");
+                    tracing::debug!(status = i64::from(status.as_u16()), "{peer} responded");
                 }
             }
-            Err(err) => tracing::error!(error = %err, "request to {peer} failed"),
+            Err(err) => {
+                span.record("error.type", reqwest_error_type(err));
+                tracing::error!(error = %err, "request to {peer} failed");
+            }
         }
         result
     }
     .instrument(span)
     .await
+}
+
+fn protocol_version(version: http::Version) -> &'static str {
+    match version {
+        http::Version::HTTP_09 => "0.9",
+        http::Version::HTTP_10 => "1.0",
+        http::Version::HTTP_2 => "2",
+        http::Version::HTTP_3 => "3",
+        _ => "1.1",
+    }
+}
+
+/// Low-cardinality `error.type` for transport failures.
+fn reqwest_error_type(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connect"
+    } else if err.is_body() || err.is_decode() {
+        "body"
+    } else if err.is_request() {
+        "request"
+    } else {
+        "_OTHER"
+    }
 }
 
 #[cfg(test)]

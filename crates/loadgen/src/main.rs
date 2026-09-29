@@ -87,7 +87,7 @@ async fn one_request(
         "loadgen.request",
         otel.name = %format!("loadgen {op} /items/{{key}}"),
         otel.status_code = Empty,
-        seq,
+        seq = seq as i64,
         key,
         trace_id = Empty,
     );
@@ -106,7 +106,7 @@ async fn one_request(
     let started = Instant::now();
     let status = async {
         let result = match request.build() {
-            Ok(req) => telemetry::http::send(client, req, "gateway").await,
+            Ok(req) => telemetry::http::send(client, req, "/items/{key}").await,
             Err(e) => Err(e),
         };
         match result {

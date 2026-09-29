@@ -5,10 +5,10 @@
 //!
 //! ```text
 //! show                           current filters and knobs
-//! log   <directives>             replace LOG_FILTER,   e.g. `log warn,store=debug`
+//! log   <directives>             replace LOG_FILTER (stdout and OTLP logs), e.g. `log warn,store=debug`
 //! trace <directives>             replace TRACE_FILTER, e.g. `trace info,store::db=trace`
 //! level <directives>             replace both
-//! set   <knob> <value>           app-registered knobs, e.g. `set chaos.failure_pct 25`
+//! set   <knob> <value>           knobs, e.g. `set span_event_level warn`, `set chaos.failure_pct 25`
 //! help
 //! ```
 //!
@@ -40,7 +40,10 @@ pub struct Knob {
 }
 
 pub struct Control {
+    /// stdout filter.
     log: FilterHandle,
+    /// OTLP log-record filter: same directives as stdout, plus the export guard.
+    log_export: FilterHandle,
     trace: FilterHandle,
     current: Mutex<(String, String)>,
     knobs: Mutex<BTreeMap<String, Arc<Knob>>>,
@@ -49,12 +52,14 @@ pub struct Control {
 impl Control {
     pub(crate) fn new(
         log: FilterHandle,
+        log_export: FilterHandle,
         trace: FilterHandle,
         log_s: String,
         trace_s: String,
     ) -> Self {
         Self {
             log,
+            log_export,
             trace,
             current: Mutex::new((log_s, trace_s)),
             knobs: Mutex::default(),
@@ -70,14 +75,16 @@ impl Control {
 
     pub fn set_log_filter(&self, directives: &str) -> anyhow::Result<()> {
         let new = filter::log_filter(directives)?;
+        let new_export = filter::export_filter(directives)?;
         self.log.reload(new)?;
+        self.log_export.reload(new_export)?;
         let old = std::mem::replace(&mut self.current.lock().unwrap().0, directives.to_owned());
         tracing::info!(%old, new = %directives, "log filter changed");
         Ok(())
     }
 
     pub fn set_trace_filter(&self, directives: &str) -> anyhow::Result<()> {
-        let new = filter::trace_filter(directives)?;
+        let new = filter::export_filter(directives)?;
         self.trace.reload(new)?;
         let old = std::mem::replace(&mut self.current.lock().unwrap().1, directives.to_owned());
         tracing::info!(%old, new = %directives, "trace filter changed");

@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use opentelemetry::trace::{SpanId, TraceContextExt, TraceId};
+use opentelemetry::trace::{SpanId, TraceContextExt, TraceFlags, TraceId};
 use serde_json::{Map, Value};
 use tracing::{Event, Level, Subscriber, field::Field};
 use tracing_subscriber::{
@@ -56,7 +56,7 @@ where
         write!(writer, "{}: ", meta.target())?;
         ctx.format_fields(writer.by_ref(), event)?;
 
-        if let Some((trace_id, span_id)) = otel_ids() {
+        if let Some((trace_id, span_id, _)) = otel_ids() {
             if ansi {
                 write!(
                     writer,
@@ -98,9 +98,14 @@ where
             }
             obj.insert("spans".into(), spans.into());
         }
-        if let Some((trace_id, span_id)) = otel_ids() {
+        // Field names per the OTel spec for trace context in non-OTLP logs.
+        if let Some((trace_id, span_id, flags)) = otel_ids() {
             obj.insert("trace_id".into(), trace_id.to_string().into());
             obj.insert("span_id".into(), span_id.to_string().into());
+            obj.insert(
+                "trace_flags".into(),
+                format!("{:02x}", flags.to_u8()).into(),
+            );
         }
 
         let line = serde_json::to_string(&obj).map_err(|_| fmt::Error)?;
@@ -113,10 +118,11 @@ where
 /// right even when the span is hidden from the *log* layer (e.g. INFO spans
 /// with `LOG_FILTER=warn`), and a DEBUG log inside a span that TRACE_FILTER
 /// drops still correlates with the nearest exported parent.
-fn otel_ids() -> Option<(TraceId, SpanId)> {
+fn otel_ids() -> Option<(TraceId, SpanId, TraceFlags)> {
     let cx = opentelemetry::Context::current();
     let sc = cx.span().span_context().clone();
-    sc.is_valid().then(|| (sc.trace_id(), sc.span_id()))
+    sc.is_valid()
+        .then(|| (sc.trace_id(), sc.span_id(), sc.trace_flags()))
 }
 
 fn level_colour(level: &Level) -> &'static str {

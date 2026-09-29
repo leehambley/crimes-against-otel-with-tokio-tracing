@@ -12,26 +12,43 @@ use crate::{AppError, Chaos};
 pub struct Valkey {
     conn: ConnectionManager,
     chaos: Arc<Chaos>,
-    address: Arc<str>,
+    host: Arc<str>,
+    port: Option<u16>,
+    db: i64,
 }
 
 impl Valkey {
     pub async fn connect(url: &str, chaos: Arc<Chaos>) -> anyhow::Result<Self> {
         let client = redis::Client::open(url)?;
-        let address: Arc<str> = client.get_connection_info().addr().to_string().into();
+        let info = client.get_connection_info();
+        let (host, port): (Arc<str>, _) = match info.addr() {
+            redis::ConnectionAddr::Tcp(h, p)
+            | redis::ConnectionAddr::TcpTls {
+                host: h, port: p, ..
+            } => (h.as_str().into(), Some(*p)),
+            other => (other.to_string().into(), None),
+        };
+        let db = info.redis_settings().db();
         let conn = ConnectionManager::new(client)
-            .instrument(tracing::info_span!("valkey.connect", server.address = %address))
+            .instrument(tracing::info_span!(
+                "valkey.connect",
+                server.address = %host,
+                server.port = port.map(i64::from)
+            ))
             .await?;
-        tracing::info!(%address, "connected to valkey");
+        tracing::info!(address = %host, port, db, "connected to valkey");
         Ok(Self {
             conn,
             chaos,
-            address,
+            host,
+            port,
+            db,
         })
     }
 
     /// Runs one command. `op` is the command name used for the span and
-    /// metrics (`GET`, `SET`, ...); `key` is recorded for debugging.
+    /// metrics (`GET`, `SET`, ...); `key` is recorded as `valkey.key` for
+    /// debugging (not a semconv attribute, hence our own namespace).
     pub async fn cmd<T: FromRedisValue>(
         &self,
         op: &'static str,
@@ -69,8 +86,11 @@ impl Valkey {
             otel.status_description = Empty,
             db.system.name = "redis",
             db.operation.name = op,
-            db.key = key,
-            server.address = %self.address,
+            db.namespace = self.db,
+            server.address = %self.host,
+            server.port = self.port.map(i64::from),
+            valkey.key = key,
+            error.type = Empty,
         );
         async move {
             let result = match self.chaos.inject(op).await {
@@ -85,6 +105,7 @@ impl Valkey {
                     let span = Span::current();
                     span.record("otel.status_code", "ERROR");
                     span.record("otel.status_description", tracing::field::display(err));
+                    span.record("error.type", err.error_type());
                 }
             }
             result

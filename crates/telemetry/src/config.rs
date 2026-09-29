@@ -1,5 +1,7 @@
 use std::{env, path::PathBuf};
 
+use tracing_subscriber::filter::LevelFilter;
+
 /// How log lines are rendered on stdout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogFormat {
@@ -29,21 +31,25 @@ impl std::str::FromStr for LogFormat {
 ///
 /// | variable                       | default                  |
 /// |--------------------------------|--------------------------|
-/// | `SERVICE_NAME`                 | per-binary               |
-/// | `DEPLOY_ENV`                   | `dev`                    |
+/// | `OTEL_SERVICE_NAME`            | `SERVICE_NAME`, then per-binary |
+/// | `OTEL_RESOURCE_ATTRIBUTES`     | e.g. `deployment.environment.name=prod` |
+/// | `OTEL_SDK_DISABLED`            | `false`; `true` = don't export |
 /// | `LOG_FORMAT`                   | `line`                   |
 /// | `LOG_FILTER` (or `RUST_LOG`)   | `info`                   |
 /// | `TRACE_FILTER`                 | same as `LOG_FILTER`     |
+/// | `SPAN_EVENT_LEVEL`             | `trace` (all events that pass TRACE_FILTER) |
 /// | `OTEL_EXPORTER_OTLP_ENDPOINT`  | unset = don't export     |
 /// | `LOG_COLOR`                    | `auto` (colour on a TTY) |
 /// | `CONTROL_SOCKET`               | `/tmp/<service>.ctl`     |
 #[derive(Clone, Debug)]
 pub struct Config {
     pub service_name: String,
-    pub environment: String,
     pub log_format: LogFormat,
     pub log_filter: String,
     pub trace_filter: String,
+    /// Events below this level are not recorded as span events (they are
+    /// still logged). Spans themselves are governed by `trace_filter` alone.
+    pub span_event_level: LevelFilter,
     pub otlp_enabled: bool,
     /// `auto`: colour when stdout is a terminal. `always` is for viewers
     /// that render ANSI but aren't a TTY themselves, like `podman logs`.
@@ -55,7 +61,10 @@ impl Config {
     pub fn from_env(default_service_name: &str) -> Self {
         let var = |name: &str| env::var(name).ok().filter(|v| !v.trim().is_empty());
 
-        let service_name = var("SERVICE_NAME").unwrap_or_else(|| default_service_name.to_owned());
+        // The standard variable wins; SERVICE_NAME is a shorter alias.
+        let service_name = var("OTEL_SERVICE_NAME")
+            .or_else(|| var("SERVICE_NAME"))
+            .unwrap_or_else(|| default_service_name.to_owned());
         let log_format = var("LOG_FORMAT")
             .map(|v| v.parse().unwrap_or_else(|e| panic!("{e}")))
             .unwrap_or(LogFormat::Line);
@@ -63,6 +72,12 @@ impl Config {
             .or_else(|| var("RUST_LOG"))
             .unwrap_or_else(|| "info".to_owned());
         let trace_filter = var("TRACE_FILTER").unwrap_or_else(|| log_filter.clone());
+        let span_event_level = var("SPAN_EVENT_LEVEL")
+            .map(|v| {
+                v.parse()
+                    .unwrap_or_else(|e| panic!("SPAN_EVENT_LEVEL {v:?}: {e}"))
+            })
+            .unwrap_or(LevelFilter::TRACE);
         let control_socket = match var("CONTROL_SOCKET").as_deref() {
             Some("off") => None,
             Some(path) => Some(PathBuf::from(path)),
@@ -80,9 +95,13 @@ impl Config {
 
         Self {
             log_color,
-            environment: var("DEPLOY_ENV").unwrap_or_else(|| "dev".to_owned()),
-            otlp_enabled: var("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
-                || var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_some(),
+            // Deliberate deviation: the spec defaults the endpoint to
+            // localhost:4318; we treat "no endpoint" as "don't export" so a
+            // bare `cargo run` doesn't spam connection errors.
+            otlp_enabled: !var("OTEL_SDK_DISABLED").is_some_and(|v| v.eq_ignore_ascii_case("true"))
+                && (var("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
+                    || var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_some()),
+            span_event_level,
             service_name,
             log_format,
             log_filter,

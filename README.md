@@ -2,19 +2,24 @@
 
 Logs, traces and metrics from one source: `tracing` spans and events. The
 application code only uses `tracing` macros; one subscriber, configured from
-the environment, decides what becomes a log line, a span in Jaeger, or a
-Prometheus series.
+the environment, decides what becomes a log line, a span in Jaeger, a log
+record in Loki, or a Prometheus series. The output follows OpenTelemetry
+conventions (OTLP, semantic-convention names, `OTEL_*` variables), so
+standard tooling understands it.
 
 ```
 loadgen ──► gateway ──┬──► store ──► valkey
                       └──► stats ──► valkey
    │           │          │
-   └───────────┴──── OTLP/HTTP ───► otel-collector ──┬─► Jaeger     (tail-sampled traces)
-                                    (tail sampling)  └─► Prometheus (metrics, unsampled)
+   └───────────┴──── OTLP/HTTP ───► otel-collector ──┬─► Jaeger     (traces, tail-sampled)
+                                    (tail sampling)  ├─► Loki       (logs, unsampled)
+                                                     └─► Prometheus (metrics, unsampled)
+                                                              ▲
+                                               Grafana ───────┘ (Loki + Prometheus, links to Jaeger)
 ```
 
-All hops propagate W3C `traceparent`, so a single request is one trace across
-four services.
+All hops propagate W3C `traceparent` and `baggage`, so a single request is one
+trace across four services.
 
 ## Run it
 
@@ -24,9 +29,16 @@ scripts/stack.sh up               # PROFILE=dev by default
 scripts/stack.sh load -n 1000 -c 32
 ```
 
-Jaeger at http://localhost:16686, Prometheus at http://localhost:9090, gateway at
-http://localhost:8080. `loadgen` ends by printing Jaeger links for failed and
-slow requests.
+| UI | URL |
+|---|---|
+| Jaeger (traces) | http://localhost:16686 |
+| Grafana (logs, metrics) | http://localhost:3000 |
+| Prometheus | http://localhost:9090 |
+| gateway | http://localhost:8080 |
+
+`loadgen` ends by printing Jaeger links for failed and slow requests. In
+Grafana → Explore → Loki, each log line with a `trace_id` has a "View trace in
+Jaeger" link.
 
 Production-like run: `PROFILE=prod scripts/stack.sh up` (and `PROFILE=prod` on
 `load`). Tear down with `scripts/stack.sh down`.
@@ -34,34 +46,50 @@ Production-like run: `PROFILE=prod scripts/stack.sh up` (and `PROFILE=prod` on
 For fast iteration, run `scripts/stack.sh infra` and `cargo run -p store` (etc.)
 on the host with `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`.
 
-## One subscriber, four layers
+## One subscriber, five layers
 
 `crates/telemetry` builds a `Registry` with:
 
 | layer | output | filter |
 |---|---|---|
 | fmt (`line`/`pretty`/`json`) | stdout | `LOG_FILTER`, reloadable |
-| `tracing-opentelemetry` | spans → OTLP; events → span events | `TRACE_FILTER`, reloadable |
-| span metrics (ours) | `span.duration` histogram, by span name, kind, route, status | INFO+ spans, always on |
+| `opentelemetry-appender-tracing` | OTLP log records → Loki | `LOG_FILTER`, reloadable |
+| `tracing-opentelemetry` | spans → OTLP; events → span events | `TRACE_FILTER` + `SPAN_EVENT_LEVEL`, reloadable |
+| span metrics (ours) | semconv duration histograms | INFO+ spans, always on |
 | `MetricsLayer` | `monotonic_counter.*` / `histogram.*` events | metric callsites only |
 
 What this means:
 
-- **Logs are span events.** Every event inside an exported span shows up on
-  that span in Jaeger, timestamped, and is also printed as a log line if it
-  passes `LOG_FILTER`. The two filters are separate, so prod can log at WARN
-  but still trace at INFO.
-- **Log lines carry `trace_id`/`span_id`** (`line` and `json`; `pretty` shows
-  it on the request span), taken from the active OpenTelemetry context. It
-  works even when the log filter hides the spans.
-- **Metrics come from spans.** Each INFO+ span that closes records its duration
-  with `status=ok|error`, so every handler, outbound call and Valkey command
-  gets rate, errors and latency without writing a counter. This layer
-  ignores the log/trace filters and runs before sampling, so the numbers are
-  complete. Explicit counters are plain events
+- **Logs are OTLP log records** carrying the trace context, so they're
+  searchable in Loki whether or not their trace was sampled. They're also
+  printed to stdout.
+- **Logs are span events too,** down to `SPAN_EVENT_LEVEL`. In dev every event
+  rides on its span in Jaeger. In prod only WARN and ERROR do, which keeps
+  spans small.
+- **stdout lines carry `trace_id`/`span_id`/`trace_flags`** (`line` and
+  `json`; `pretty` shows the trace id on the request span), taken from the
+  active OpenTelemetry context. It works even when the log filter hides the
+  spans.
+- **Metrics come from spans,** under semantic-convention names:
+
+  | span | instrument |
+  |---|---|
+  | HTTP server | `http.server.request.duration` |
+  | HTTP client | `http.client.request.duration` |
+  | Valkey command | `db.client.operation.duration` |
+  | any other INFO+ span | `span.duration` |
+
+  Each carries the semconv attributes, including `error.type` on failure.
+  This layer ignores the log/trace filters and runs before sampling, so the
+  numbers are complete. Explicit counters are plain events
   (`tracing::event!(target: "metrics", Level::TRACE, monotonic_counter.foo = 1u64)`).
 - **Errors mark spans.** An `ERROR` event, or `otel.status_code = "ERROR"`,
-  sets the span status. The collector's tail sampler looks for this status.
+  sets the span status, and the collector's tail sampler looks for it. The
+  convention in this repo is that `error!` means "this operation failed";
+  anything handled or recoverable is `warn!`.
+- **Span status follows semconv.** Server spans are errors on 5xx. Client
+  spans are errors on 4xx and 5xx, but the sampler ignores client-side 4xx,
+  so 404s don't force-keep traces.
 
 ### Span levels = trace verbosity
 
@@ -71,18 +99,22 @@ What this means:
 | DEBUG | handlers, `authorize`, `validate` | dev |
 | TRACE | `encode`, `decode` | dev |
 
-Same binary, different `TRACE_FILTER`.
+Same binary, different `TRACE_FILTER`. Put anything you'd build a dashboard
+or SLO on at INFO.
 
 ## Configuration (environment)
 
 | variable | default | notes |
 |---|---|---|
+| `OTEL_SERVICE_NAME` | `SERVICE_NAME`, then per binary | standard; `SERVICE_NAME` is an alias |
+| `OTEL_RESOURCE_ATTRIBUTES` | | e.g. `deployment.environment.name=prod`; `service.version` and `service.instance.id` are filled in |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset = no export | deliberate deviation from the spec default of `localhost:4318`; other `OTEL_EXPORTER_OTLP_*`, `OTEL_BSP_*`, `OTEL_METRIC_EXPORT_INTERVAL` apply as usual |
+| `OTEL_SDK_DISABLED` | `false` | `true` turns off all export |
 | `LOG_FORMAT` | `line` | `line`, `pretty` (multi-line with span stack), `json` |
 | `LOG_COLOR` | `auto` | `auto` = colour on a TTY (respects `NO_COLOR`), `always`, `never`; dev forces it on for `podman logs` |
-| `LOG_FILTER` / `RUST_LOG` | `info` | `EnvFilter` syntax |
-| `TRACE_FILTER` | = `LOG_FILTER` | exporter internals (`hyper`, `h2`, `opentelemetry*`, …) are always excluded to avoid feedback loops |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset = no export | standard OTel SDK vars apply (`OTEL_BSP_*`, `OTEL_METRIC_EXPORT_INTERVAL`, …) |
-| `SERVICE_NAME`, `DEPLOY_ENV` | per binary, `dev` | resource attributes |
+| `LOG_FILTER` / `RUST_LOG` | `info` | `EnvFilter` syntax; stdout and OTLP logs |
+| `TRACE_FILTER` | = `LOG_FILTER` | which spans (and events) are exported |
+| `SPAN_EVENT_LEVEL` | `trace` | events below this aren't attached to spans |
 | `CONTROL_SOCKET` | `$TMPDIR/<service>.ctl` | `off` to disable |
 | `CHAOS_FAILURE_PCT` | `0` | % of Valkey commands / auth checks that fail |
 | `CHAOS_SLOW_PCT`, `CHAOS_SLOW_MS` | `0`, `250` | injected latency |
@@ -90,7 +122,9 @@ Same binary, different `TRACE_FILTER`.
 | `SAMPLING_SLOW_MS` | `1000` | collector: traces slower than this are kept |
 | `SAMPLING_DECISION_WAIT` | `5s` | collector: how long to buffer a trace before deciding |
 
-Profiles are in `env/dev.env` and `env/prod.env`.
+Exporter internals (`hyper`, `h2`, `opentelemetry*`, …) are always excluded
+from the OTLP layers to avoid feedback loops. Profiles are in `env/dev.env`
+and `env/prod.env`.
 
 ## Changing levels at runtime
 
@@ -99,9 +133,10 @@ outside the process, so each service listens on a Unix control socket:
 
 ```bash
 scripts/stack.sh ctl store show
-scripts/stack.sh ctl store log warn,store=debug       # LOG_FILTER
+scripts/stack.sh ctl store log warn,store=debug       # LOG_FILTER (stdout + OTLP logs)
 scripts/stack.sh ctl store trace info,store=trace     # TRACE_FILTER
 scripts/stack.sh ctl store level debug                # both
+scripts/stack.sh ctl store set span_event_level debug
 scripts/stack.sh ctl gateway set chaos.failure_pct 25
 ```
 
@@ -109,29 +144,41 @@ scripts/stack.sh ctl gateway set chaos.failure_pct 25
 
 ## Sampling
 
-Services export every span that passes `TRACE_FILTER`. The OpenTelemetry
-Collector buffers each trace and then decides whether to keep it (see
-`deploy/otel-collector.yaml`). A trace is kept if any of these match:
+The SDK records every span that passes `TRACE_FILTER` (`AlwaysOn`, whatever
+the caller's `sampled` flag says). The OpenTelemetry Collector buffers each
+trace and then decides whether to keep it (see `deploy/otel-collector.yaml`).
+A trace is kept if any of these match:
 
-1. any span has status ERROR, in any service → **always kept**
+1. any span has status ERROR, in any service, other than a client-side 4xx →
+   **always kept**
 2. the trace is slower than `SAMPLING_SLOW_MS`
 3. its trace id falls in the `SAMPLING_PERCENT` bucket
 
 Head sampling in the SDK can't do this. When the root span starts, nobody
-knows yet whether `stats` will fail 40ms later. So sampling happens in the
-collector, and the SDK has no sampler.
+knows yet whether `stats` will fail 40ms later.
 
-Example `prod` run with 1000 requests: 113 traces kept, made up of all 40 that
-contained an error span, 20 slow ones and 53 baseline (about 5%). The 40
-include 14 requests that returned 2xx but where the stats call failed.
+Example `prod` run with 1000 requests: 101 traces kept. That's every failed
+request and every request with a failed downstream call (including ones that
+returned 2xx because stats was optional), the slow ones, and about 5% of the
+rest. 2 of the 33 404s were kept, which is the baseline, as intended. The
+collector's per-policy counters (`otelcol_processor_tail_sampling_*`) are in
+Prometheus.
 
 ## Notes / deviations
 
+See [CRITIQUE.md](CRITIQUE.md) for a full comparison with OpenTelemetry
+practice. In brief:
+
 - **"Jaeger format":** the OpenTelemetry Rust Jaeger exporter was removed
-  upstream, and Jaeger v2 takes OTLP natively. Everything uses OTLP, and Jaeger
-  stores and shows it as usual. The Jaeger `uber-trace-id` propagator
-  (`opentelemetry-jaeger-propagator`) is one release behind `opentelemetry`
-  0.33, so propagation is W3C only for now.
-- Collector 0.161 and Jaeger 2.21 are pinned in `scripts/stack.sh`.
-- `stack.sh` uses plain `podman run` on a podman network, so you don't need
-  `podman-compose`.
+  upstream, and Jaeger v2 takes OTLP natively. The Jaeger `uber-trace-id`
+  propagator is one release behind `opentelemetry` 0.33, so propagation is W3C
+  (`traceparent` + `baggage`).
+- **No Jaeger datasource in Grafana:** Jaeger 2.21 serves only its v3 API,
+  which Grafana 13's Jaeger datasource doesn't use. Logs link out to the
+  Jaeger UI instead.
+- **Integer span fields are recorded as `i64`:** `tracing-opentelemetry` exports
+  `u16`/`u64` fields as strings.
+- **Pinned versions:** Collector 0.161, Jaeger 2.21, Loki 3.7.8, Grafana
+  13.2.3 and Prometheus 3.15, all in `scripts/stack.sh`.
+- **No `podman-compose` needed:** `stack.sh` uses plain `podman run` on a
+  podman network.

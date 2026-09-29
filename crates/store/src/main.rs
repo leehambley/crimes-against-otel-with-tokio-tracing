@@ -53,7 +53,7 @@ async fn put_item(
     .await?;
 
     tracing::event!(target: "metrics", tracing::Level::TRACE, monotonic_counter.store_bytes_written = encoded.len() as u64);
-    tracing::debug!(bytes = encoded.len(), %checksum, "item stored");
+    tracing::debug!(bytes = encoded.len() as i64, %checksum, "item stored");
     Ok((
         StatusCode::CREATED,
         Json(json!({ "key": key, "bytes": encoded.len(), "checksum": checksum })),
@@ -73,7 +73,7 @@ async fn get_item(
         return Err(AppError::NotFound);
     };
     let value: Value = decode(&raw)?;
-    tracing::debug!(bytes = raw.len(), "item loaded");
+    tracing::debug!(bytes = raw.len() as i64, "item loaded");
     Ok(Json(json!({ "key": key, "value": value })))
 }
 
@@ -100,12 +100,12 @@ fn validate(key: &str, body: Value) -> Result<Value, AppError> {
 fn encode(value: &Value) -> (String, String) {
     let encoded = value.to_string();
     let checksum = format!("{:016x}", fnv1a(encoded.as_bytes()));
-    tracing::Span::current().record("bytes", encoded.len());
+    tracing::Span::current().record("bytes", encoded.len() as i64);
     tracing::trace!(%checksum, "encoded");
     (encoded, checksum)
 }
 
-#[tracing::instrument(level = "trace", skip_all, fields(bytes = raw.len()))]
+#[tracing::instrument(level = "trace", skip_all, fields(bytes = raw.len() as i64))]
 fn decode(raw: &str) -> Result<Value, AppError> {
     serde_json::from_str(raw).map_err(|e| AppError::BadRequest(format!("corrupt item: {e}")))
 }

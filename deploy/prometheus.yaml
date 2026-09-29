@@ -6,3 +6,6 @@ scrape_configs:
     honor_labels: true
     static_configs:
       - targets: ["otel-collector:8889"]
+  - job_name: otel-collector-internal
+    static_configs:
+      - targets: ["otel-collector:8888"]

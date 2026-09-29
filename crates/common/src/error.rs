@@ -25,6 +25,19 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// Low-cardinality `error.type` for spans and metrics.
+    pub fn error_type(&self) -> String {
+        match self {
+            Self::NotFound => "not_found".into(),
+            Self::BadRequest(_) => "bad_request".into(),
+            Self::Chaos(c) => c.error_type.into(),
+            Self::Valkey(e) => e
+                .code()
+                .map_or_else(|| format!("{:?}", e.kind()), str::to_owned),
+            Self::Upstream { .. } => "upstream".into(),
+        }
+    }
+
     fn status(&self) -> StatusCode {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
@@ -40,9 +53,9 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
         if status.is_server_error() {
-            tracing::error!(error = %self, status = status.as_u16(), "request failed");
+            tracing::error!(error = %self, status = i64::from(status.as_u16()), "request failed");
         } else {
-            tracing::debug!(error = %self, status = status.as_u16(), "request rejected");
+            tracing::debug!(error = %self, status = i64::from(status.as_u16()), "request rejected");
         }
         (status, Json(json!({ "error": self.to_string() }))).into_response()
     }

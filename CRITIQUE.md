@@ -14,23 +14,28 @@ Verdicts:
 
 ## Summary
 
-| # | Area | Deviation | Verdict |
-|---|------|-----------|---------|
-| 1 | Logs | Logs are span events + stdout, not OTLP log records | Fix (add OTLP logs, keep stdout) |
-| 2 | Logs | Span events are the only place logs live in the backend | Fix |
-| 3 | Metrics | One generic `span.duration` instead of semconv instruments | Fix (rename) or move to collector |
-| 4 | Metrics | Metrics from events with magic field prefixes | Keep, with care |
-| 5 | Metrics | No exemplars linking metrics to traces | Fix eventually |
-| 6 | Traces | Span *verbosity levels* change the shape of the trace | Keep. This is the main idea |
-| 7 | Traces | `ERROR` log ⇒ span status Error ⇒ trace always kept | Keep, but make it explicit |
-| 8 | Traces | Semantic-convention gaps (error.type, client 4xx, ports, …) | Fix |
-| 9 | Sampling | No SDK sampler; all sampling is tail sampling in the collector | Keep, but know what it costs |
-| 10 | Sampling | `ParentBased` default can drop spans the tail sampler never sees | Fix |
-| 11 | Config | Home-grown env vars instead of `OTEL_*` | Fix (support both) |
-| 12 | Config | Control socket instead of OpAMP / declarative config | Keep for now |
-| 13 | Propagation | W3C `traceparent` only; no baggage, no Jaeger header | Fix (baggage), Depends (Jaeger) |
-| 14 | Export | OTLP instead of "Jaeger format" | Keep. OTLP is the standard now |
-| 15 | Bridge | `tracing` → OTel via a community bridge, two context systems | Keep. It's the Rust norm |
+The **Status** column shows where things stand after the second pass (see
+[What changed in the second pass](#what-changed-in-the-second-pass)). The
+per-item analysis below is the original critique, kept as written.
+
+| # | Area | Deviation | Verdict | Status |
+|---|------|-----------|---------|--------|
+| 1 | Logs | Logs are span events + stdout, not OTLP log records | Fix (add OTLP logs, keep stdout) | ✅ Done: appender → collector → Loki |
+| 2 | Logs | Span events are the only place logs live in the backend | Fix | ✅ Done: `SPAN_EVENT_LEVEL` (prod: WARN+) |
+| 3 | Metrics | One generic `span.duration` instead of semconv instruments | Fix (rename) or move to collector | ✅ Done: semconv instruments, attributes and buckets |
+| 4 | Metrics | Metrics from events with magic field prefixes | Keep, with care | Kept |
+| 5 | Metrics | No exemplars linking metrics to traces | Fix eventually | ⏳ Open |
+| 6 | Traces | Span *verbosity levels* change the shape of the trace | Keep. This is the main idea | Kept, documented |
+| 7 | Traces | `ERROR` log ⇒ span status Error ⇒ trace always kept | Keep, but make it explicit | ✅ Convention documented |
+| 8 | Traces | Semantic-convention gaps (error.type, client 4xx, ports, …) | Fix | ✅ Done |
+| 9 | Sampling | No SDK sampler; all sampling is tail sampling in the collector | Keep, but know what it costs | Kept; single collector tier still (⏳) |
+| 10 | Sampling | `ParentBased` default can drop spans the tail sampler never sees | Fix | ✅ Done: explicit `AlwaysOn` |
+| 11 | Config | Home-grown env vars instead of `OTEL_*` | Fix (support both) | ✅ Done |
+| 12 | Config | Control socket instead of OpAMP / declarative config | Keep for now | Kept |
+| 13 | Propagation | W3C `traceparent` only; no baggage, no Jaeger header | Fix (baggage), Depends (Jaeger) | ✅ Baggage done; Jaeger still blocked by crate versions |
+| 14 | Export | OTLP instead of "Jaeger format" | Keep. OTLP is the standard now | Kept |
+| 15 | Bridge | `tracing` → OTel via a community bridge, two context systems | Keep. It's the Rust norm | Kept; see item 16 |
+| 16 | Bridge | Unsigned integer fields exported as *strings* | (found in pass two) | ✅ Worked around |
 
 ---
 
@@ -337,6 +342,72 @@ instrumented. `tokio`, `hyper`, `tower`, `reqwest` and `sqlx` all emit
 `tracing`, not OTel. A native-OTel-only design would lose all of that.
 
 ---
+
+## What changed in the second pass
+
+- **Sampling correctness (item 10):** the SDK sampler is now `AlwaysOn`. A
+  caller sending `sampled=0` can no longer stop spans reaching the tail
+  sampler.
+- **Propagation (item 13):** the propagator is the spec's default
+  `tracecontext,baggage`.
+- **Semconv spans (item 8):**
+  - `error.type` on every failed HTTP and DB span.
+  - Client spans are errors on 4xx/5xx and named `{method} {url.template}`.
+  - Server spans add `url.scheme`, `server.address`/`server.port`,
+    `network.protocol.version` and `user_agent.original`.
+  - DB spans split `server.port` out, add `db.namespace`, and move the key to
+    our own `valkey.key` attribute.
+  - The instrumentation scope is the crate (`telemetry`), not the service.
+- **Sampler vs. client 4xx:** making client 4xx an error would have
+  force-kept every trace containing a 404. The collector's error policy is
+  now an OTTL condition that ignores client spans with a 4xx status. Checked
+  with 1000 prod requests: 2 of 33 404 traces kept, which is the 5% baseline.
+- **Semconv metrics (item 3):** `http.server.request.duration`,
+  `http.client.request.duration` and `db.client.operation.duration`, each
+  with the semconv attribute set and recommended buckets. `span.duration`
+  remains for spans with no convention. The status label is replaced by
+  `error.type`. Unit tests cover the routing.
+- **Logs (items 1–2):**
+  - `opentelemetry-appender-tracing` exports log records over OTLP, under the
+    same reloadable `LOG_FILTER` as stdout, plus the exporter feedback guard.
+  - The collector sends them to Loki, unsampled.
+  - `SPAN_EVENT_LEVEL` limits which events become span events. It can be
+    changed at runtime, and prod uses `warn`.
+  - JSON stdout gained `trace_flags`.
+- **Configuration (item 11):**
+  - `OTEL_SERVICE_NAME` takes precedence (`SERVICE_NAME` is an alias).
+  - `OTEL_RESOURCE_ATTRIBUTES` replaces `DEPLOY_ENV`.
+  - `OTEL_SDK_DISABLED` is honoured.
+  - `service.version` and a per-process `service.instance.id` are added.
+  - The one remaining deviation, "no endpoint = no export", is documented.
+- **Grafana** is provisioned with Loki and Prometheus. Log lines link to their
+  trace in the Jaeger UI. A Jaeger datasource wasn't possible, because Jaeger
+  2.21 serves only its v3 API and Grafana 13's Jaeger datasource doesn't use
+  it.
+- **Collector self-metrics** are scraped by Prometheus, including
+  tail-sampling decisions per policy.
+
+### 16. Unsigned integers become strings (found in pass two)
+
+`tracing-opentelemetry` 0.34's span and event visitors implement
+`record_i64` but not `record_u64`. `tracing`'s default then routes `u64`
+through `record_debug`, so `status.as_u16()` was exported as the *string*
+`"404"`. That violates semconv (`http.response.status_code` is an int). It
+also made the collector's OTTL `< 500` comparison unreliable: in one run it
+force-kept every 404 trace, and in another it didn't. We now record every
+integer span or event field as `i64`, and the reason is documented in
+[http.rs](crates/telemetry/src/http.rs). This is a small example of the cost
+of the bridge (item 15). A fix upstream (`record_u64` → `Value::I64` when it
+fits) would remove the workaround.
+
+### Still open
+
+- **Exemplars (item 5):** needs the span's context active at record time, and
+  a policy for linking only to traces that will survive tail sampling.
+- **Two-tier collector (item 9):** a `loadbalancing` exporter routing by trace
+  id is needed before running more than one collector.
+- **Jaeger propagator (item 13):** waiting on
+  `opentelemetry-jaeger-propagator` to catch up with `opentelemetry` 0.33.
 
 ## Overall assessment
 

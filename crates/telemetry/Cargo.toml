@@ -9,6 +9,7 @@ anyhow.workspace = true
 axum.workspace = true
 http.workspace = true
 opentelemetry.workspace = true
+opentelemetry-appender-tracing = "0.33.0"
 opentelemetry-http.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
@@ -18,3 +19,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+uuid = { version = "1.26.1", features = ["v4"] }
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing", "metrics"] }

@@ -61,6 +61,7 @@ async fn put_item(
     let stored = up
         .call(
             "store",
+            "/items/{key}",
             up.client
                 .put(format!("{}/items/{key}", up.store))
                 .json(&body),
@@ -80,7 +81,11 @@ async fn get_item(
     authorize(&up).await?;
     // Two concurrent child spans under the same parent.
     let (item, event) = tokio::join!(
-        up.call("store", up.client.get(format!("{}/items/{key}", up.store))),
+        up.call(
+            "store",
+            "/items/{key}",
+            up.client.get(format!("{}/items/{key}", up.store))
+        ),
         up.record_event(&key, "read"),
     );
     if let Err(err) = event {
@@ -98,7 +103,7 @@ async fn top(
         Some(q) => format!("{}/top?{q}", up.stats),
         None => format!("{}/top", up.stats),
     };
-    Ok(Json(up.call("stats", up.client.get(url)).await?))
+    Ok(Json(up.call("stats", "/top", up.client.get(url)).await?))
 }
 
 /// Stand-in for an auth check: a place for gateway-local chaos to strike.
@@ -112,6 +117,7 @@ impl Upstreams {
     async fn record_event(&self, key: &str, kind: &str) -> Result<Value, AppError> {
         self.call(
             "stats",
+            "/events",
             self.client
                 .post(format!("{}/events", self.stats))
                 .json(&json!({ "key": key, "kind": kind })),
@@ -120,14 +126,16 @@ impl Upstreams {
     }
 
     /// Sends a request with trace propagation and maps the outcome.
+    /// `url_template` names the client span and labels its metrics.
     async fn call(
         &self,
         peer: &'static str,
+        url_template: &'static str,
         request: reqwest::RequestBuilder,
     ) -> Result<Value, AppError> {
         let upstream = |detail: String| AppError::Upstream { peer, detail };
         let request = request.build().map_err(|e| upstream(e.to_string()))?;
-        let response = telemetry::http::send(&self.client, request, peer)
+        let response = telemetry::http::send(&self.client, request, url_template)
             .await
             .map_err(|e| upstream(e.to_string()))?;
         let status = response.status();
