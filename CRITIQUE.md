@@ -386,6 +386,15 @@ instrumented. `tokio`, `hyper`, `tower`, `reqwest` and `sqlx` all emit
   it.
 - **Collector self-metrics** are scraped by Prometheus, including
   tail-sampling decisions per policy.
+- **Checked "always keep errors" against the logs:**
+  - Loki's unsampled ERROR records serve as ground truth. Result: 273 of 273
+    error traces kept, all complete.
+  - The first audit found late spans. Prod exported spans every 5s (the SDK
+    default), which was the same as `decision_wait`. Now prod exports every
+    2s and the collector waits 10s. The collector also remembers its
+    decisions, so late spans follow their trace's verdict.
+  - The OTTL status-code comparison uses `Int()`, so a type mismatch can't
+    silently turn "keep" into "drop".
 
 ### 16. Unsigned integers become strings (found in pass two)
 

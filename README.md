@@ -120,7 +120,7 @@ or SLO on at INFO.
 | `CHAOS_SLOW_PCT`, `CHAOS_SLOW_MS` | `0`, `250` | injected latency |
 | `SAMPLING_PERCENT` | `10` | collector: baseline share of healthy traces kept |
 | `SAMPLING_SLOW_MS` | `1000` | collector: traces slower than this are kept |
-| `SAMPLING_DECISION_WAIT` | `5s` | collector: how long to buffer a trace before deciding |
+| `SAMPLING_DECISION_WAIT` | `10s` (dev `5s`) | collector: how long to buffer a trace before deciding; must exceed the longest trace plus `OTEL_BSP_SCHEDULE_DELAY` |
 
 Exporter internals (`hyper`, `h2`, `opentelemetry*`, …) are always excluded
 from the OTLP layers to avoid feedback loops. Profiles are in `env/dev.env`
@@ -156,6 +156,17 @@ A trace is kept if any of these match:
 
 Head sampling in the SDK can't do this. When the root span starts, nobody
 knows yet whether `stats` will fail 40ms later.
+
+**Verified.** Loki receives every log unsampled, so its ERROR records give an
+independent list of which traces failed. Across 2000 prod requests with 5%
+chaos per service, all 273 traces with an ERROR log were in Jaeger, each
+complete. The collector's `keep-all-errors` count was also 273.
+
+What can still escape: spans the services never send (below `TRACE_FILTER`,
+or dropped when the SDK export queue overflows), and traces lost if the
+collector restarts or runs out of memory during `decision_wait`. The
+collector remembers its decisions, so a span that arrives late follows its
+trace's verdict instead of being judged on its own.
 
 Example `prod` run with 1000 requests: 101 traces kept. That's every failed
 request and every request with a failed downstream call (including ones that

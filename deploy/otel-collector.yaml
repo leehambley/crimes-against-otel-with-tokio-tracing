@@ -19,10 +19,20 @@ processors:
 
   # Policies are OR'd: a trace is kept if any policy says so.
   tail_sampling:
-    decision_wait: ${env:SAMPLING_DECISION_WAIT:-5s}
+    # Must exceed the longest trace plus the services' export delay
+    # (OTEL_BSP_SCHEDULE_DELAY), or spans arrive after the decision.
+    decision_wait: ${env:SAMPLING_DECISION_WAIT:-10s}
     num_traces: 50000
     expected_new_traces_per_sec: 200
+    # Remember decisions so late spans follow their trace's verdict instead
+    # of being judged alone (which could keep an error fragment but drop
+    # the rest of its trace).
+    decision_cache:
+      sampled_cache_size: 100000
+      non_sampled_cache_size: 100000
     policies:
+      # Int() so a string-typed status code can't make the condition error
+      # out (error_mode: ignore would then silently *not* keep the trace).
       # Any span with status ERROR, except HTTP *client* spans that only got
       # a 4xx: semconv marks those as errors, but a 404 from a lookup
       # shouldn't force-keep the trace. Server 5xx, transport failures and
@@ -36,7 +46,7 @@ processors:
               span.status.code == STATUS_CODE_ERROR and
               not (span.kind == SPAN_KIND_CLIENT and
                    span.attributes["http.response.status_code"] != nil and
-                   span.attributes["http.response.status_code"] < 500)
+                   Int(span.attributes["http.response.status_code"]) < 500)
       - name: keep-slow
         type: latency
         latency:
