@@ -1,0 +1,62 @@
+# Every service exports 100% of the spans that pass its TRACE_FILTER to this
+# collector. Sampling happens here, *after* a trace is complete, which is the
+# only place "keep every trace that contains an error" can be decided: the
+# error may occur in a different service, long after the root span was
+# created.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  # Policies are OR'd: a trace is kept if any policy says so.
+  tail_sampling:
+    decision_wait: ${env:SAMPLING_DECISION_WAIT:-5s}
+    num_traces: 50000
+    expected_new_traces_per_sec: 200
+    policies:
+      - name: keep-all-errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: keep-slow
+        type: latency
+        latency:
+          threshold_ms: ${env:SAMPLING_SLOW_MS:-1000}
+      - name: baseline
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: ${env:SAMPLING_PERCENT:-10}
+
+  batch: {}
+
+exporters:
+  otlp_grpc/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, tail_sampling, batch]
+      exporters: [otlp_grpc/jaeger]
+    # Metrics are never sampled: they come from every span, before sampling.
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]

@@ -1,0 +1,17 @@
+[package]
+name = "common"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+rand.workspace = true
+redis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+telemetry.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
