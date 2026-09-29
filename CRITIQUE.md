@@ -14,9 +14,12 @@ Verdicts:
 
 ## Summary
 
-The **Status** column shows where things stand after the second pass (see
-[What changed in the second pass](#what-changed-in-the-second-pass)). The
-per-item analysis below is the original critique, kept as written.
+The **Status** column shows where things stand now. Items 1–15 are the
+original critique, with notes where later work changed the picture.
+Item 16 was found while fixing them (see
+[What changed in the second pass](#what-changed-in-the-second-pass)).
+Items 17–23 are tradeoffs that the fixes themselves introduced (see
+[Tradeoffs introduced by the fixes](#tradeoffs-introduced-by-the-fixes)).
 
 | # | Area | Deviation | Verdict | Status |
 |---|------|-----------|---------|--------|
@@ -28,7 +31,7 @@ per-item analysis below is the original critique, kept as written.
 | 6 | Traces | Span *verbosity levels* change the shape of the trace | Keep. This is the main idea | Kept, documented |
 | 7 | Traces | `ERROR` log ⇒ span status Error ⇒ trace always kept | Keep, but make it explicit | ✅ Convention documented |
 | 8 | Traces | Semantic-convention gaps (error.type, client 4xx, ports, …) | Fix | ✅ Done |
-| 9 | Sampling | No SDK sampler; all sampling is tail sampling in the collector | Keep, but know what it costs | Kept; single collector tier still (⏳) |
+| 9 | Sampling | No SDK sampler; all sampling is tail sampling in the collector | Keep, but know what it costs | Kept; late spans fixed, verified 273/273; single collector tier still (⏳) |
 | 10 | Sampling | `ParentBased` default can drop spans the tail sampler never sees | Fix | ✅ Done: explicit `AlwaysOn` |
 | 11 | Config | Home-grown env vars instead of `OTEL_*` | Fix (support both) | ✅ Done |
 | 12 | Config | Control socket instead of OpAMP / declarative config | Keep for now | Kept |
@@ -36,6 +39,13 @@ per-item analysis below is the original critique, kept as written.
 | 14 | Export | OTLP instead of "Jaeger format" | Keep. OTLP is the standard now | Kept |
 | 15 | Bridge | `tracing` → OTel via a community bridge, two context systems | Keep. It's the Rust norm | Kept; see item 16 |
 | 16 | Bridge | Unsigned integer fields exported as *strings* | (found in pass two) | ✅ Worked around |
+| 17 | Sampling | Client-side 4xx error spans don't force-keep a trace | Keep, but it changes the requirement | ⚠️ Deliberate; documented |
+| 18 | Metrics | Demoting a span below INFO silently deletes its metric | Fix | ⏳ Open |
+| 19 | Metrics | Two layers each decide "was this an error?" | Fix (consistency test) | ⏳ Open |
+| 20 | Sampling | Sampling can't be influenced from `tracing` or at runtime | Depends | ⏳ Open |
+| 21 | Logs | Prod has no INFO logs anywhere | Keep (it's a choice) | Documented |
+| 22 | Logs | WARN/ERROR stored twice in prod (Loki and span events) | Keep | Documented |
+| 23 | Misc | Smaller gaps: OTTL error mode, no Grafana→Jaeger datasource, `service.version`, `span.duration` naming | Mixed | Mixed |
 
 ---
 
@@ -77,6 +87,11 @@ context, rather than to grow the span-event API. Problems we inherit today:
 **Verdict: Fix, partly.** Span events are great in dev. For prod, logs should
 be their own signal (item 1). Then span events can be limited, for example to
 WARN and above, through `TRACE_FILTER`, which we already have.
+
+> **Update:** `TRACE_FILTER` couldn't do this, because it filters spans and
+> events together, and INFO events would have taken INFO spans with them. We
+> added `SPAN_EVENT_LEVEL`, a separate runtime setting that only gates
+> events. Prod uses `warn`.
 
 ---
 
@@ -225,7 +240,8 @@ for that requirement. What it costs:
 
 - **Network and CPU for 100% of spans**, most of which get dropped. The
   verbosity filter (item 6) is what keeps this affordable.
-- **Collector memory.** Every trace is held for `decision_wait` (5s).
+- **Collector memory.** Every trace is held for `decision_wait` (now 10s in
+  prod).
   `num_traces: 50000` caps it, and under overload traces get dropped
   unpredictably.
 - **Scaling needs two tiers.** All spans of a trace must reach the same
@@ -238,6 +254,13 @@ for that requirement. What it costs:
 **Verdict: Keep.** It's the right tool for the requirement. Before production,
 add the two-tier setup and consider a light SDK head sample for very
 high-traffic, low-value routes.
+
+> **Update:** the late-spans risk was real. Prod exported spans every 5s, the
+> same as `decision_wait`, and an audit counted 19 late spans. Now prod
+> exports every 2s, the collector waits 10s, and it remembers its decisions
+> so late spans follow their trace's verdict. Checked against Loki's
+> unsampled ERROR logs: 273 of 273 error traces kept, all complete, no late
+> spans. The two-tier setup is still to do.
 
 ### 10. `ParentBased` can undermine tail sampling
 
@@ -289,8 +312,9 @@ OTel's answers to remote configuration are:
   SDKs.
 - **Declarative configuration**, a standard config file format for SDKs.
 
-Neither has meaningful support in the Rust SDK yet, and neither has a concept
-of per-module verbosity to change. The Unix socket is simple, local, and
+As far as I know, neither has meaningful support in the Rust SDK yet
+(*not verified for this document*), and neither has a concept of per-module
+verbosity to change. The Unix socket is simple, local, and
 needs `exec` access to the container, which is a reasonable security
 boundary.
 
@@ -335,7 +359,9 @@ It maps one context system (`tracing` spans in the registry) onto another
 - Libraries instrumented with the OTel API directly only nest correctly
   because context activation is on.
 
-It also costs more CPU per span than the native OTel API.
+It's commonly said to cost more CPU per span than the native OTel API. *We
+haven't measured that here*, so treat it as a claim to benchmark before
+relying on it.
 
 **Verdict: Keep.** In Rust, `tracing` is still how libraries are
 instrumented. `tokio`, `hyper`, `tower`, `reqwest` and `sqlx` all emit
@@ -418,6 +444,104 @@ fits) would remove the workaround.
 - **Jaeger propagator (item 13):** waiting on
   `opentelemetry-jaeger-propagator` to catch up with `opentelemetry` 0.33.
 
+## Tradeoffs introduced by the fixes
+
+### 17. Client 4xx errors don't force-keep a trace
+
+The original requirement was that **any trace containing a span with an
+error is kept at 100%**. Semconv says an HTTP client span that gets a 4xx is
+an error, and item 8 adopted that. Taken literally, every lookup that 404s
+would then force-keep its trace. So the collector's error policy excludes
+client spans whose only problem is a 4xx
+([otel-collector.yaml](deploy/otel-collector.yaml)).
+
+The consequence: **a trace whose only error span is a client-side 4xx is not
+guaranteed to be kept.** It falls back to the baseline percentage and the
+slow-trace rule. Server-side 5xx, transport failures and failed Valkey calls
+are unaffected, and the audit shows 100% of those kept.
+
+**Verdict: Keep, but know it's a change to the requirement.** A 4xx is usually
+the caller's fault and is visible on the server span as a 4xx anyway. If a
+service needs 4xx traces, make the exclusion configurable, for example a
+`SAMPLING_KEEP_CLIENT_4XX` variable that drops the `not (…)` clause, rather
+than removing it everywhere.
+
+### 18. Demoting a span deletes its metric
+
+The span-metrics layer only measures spans at INFO or above, so metrics don't
+depend on `TRACE_FILTER`. That also means moving `valkey.command` to
+`debug_span!` would silently remove `db.client.operation.duration`, with no
+error and no warning.
+
+**Verdict: Fix.** Choose spans for metrics by *what they are*, not only their
+level. Span metadata includes field names, so the metrics filter can also
+accept any span that declares `otel.kind` or `db.system.name`, whatever its
+level. Add a test that lists the spans that must produce metrics.
+
+### 19. Two layers decide "was this an error?"
+
+The OpenTelemetry layer sets the span status from ERROR events and
+`otel.status_code`. The span-metrics layer computes `error.type` from the same
+two signals, with its own code. They agree today. Nothing makes sure they
+keep agreeing, and a disagreement would mean dashboards and trace sampling
+see different error rates.
+
+**Verdict: Fix.** Add a test that sends one span through every layer and
+checks that the exported span status, the metric's `error.type` and the OTLP
+log record agree.
+
+### 20. Sampling is out of `tracing`'s reach
+
+Every other control lives in `tracing` terms: levels, filters, fields, and the
+control socket. The keep/drop decision lives only in the collector's config,
+and changing it means restarting the collector. That is the right place to
+*make* the decision, because only the collector sees the whole trace. But
+there's no way to *influence* it from code or at runtime.
+
+**Verdict: Depends.** A cheap bridge: the collector honours a span field such
+as `sampling.keep = true` (one more OTTL condition). Code can then mark
+important operations with a field, and a control-socket setting could turn it
+on per route. Worth doing if the project grows; not needed for the demo.
+
+### 21. Prod has no INFO logs anywhere
+
+`LOG_FILTER` now governs OTLP logs as well as stdout, which is the right
+default: one knob, one meaning. With `LOG_FILTER=warn` in prod, INFO events
+such as "request completed" aren't printed, aren't in Loki, and (because
+`SPAN_EVENT_LEVEL=warn`) aren't on spans. They exist only as metrics.
+
+**Verdict: Keep. It's a choice, not a bug.** If you want INFO in Loki but not
+on stdout, add a separate `LOG_EXPORT_FILTER` (a third reload handle, about
+ten lines). Until then, raising the level at runtime via the control socket is
+the way to see INFO in prod.
+
+### 22. WARN and ERROR are stored twice in prod
+
+A `warn!` in prod becomes an OTLP log record (Loki) and a span event (Jaeger,
+if its trace is kept). That duplicates storage for exactly the events you most
+want to see.
+
+**Verdict: Keep.** The volume is small, and each copy is useful where it
+lives: in Jaeger you see the failure in the timeline, and in Loki you can
+search it even when the trace was dropped.
+
+### 23. Smaller gaps
+
+- **The OTTL rule uses `error_mode: ignore`.** Any evaluation error means
+  "don't keep". `Int()` removed the known type issue, but a future attribute
+  change could reintroduce silent drops. **Fix:** alert on
+  `otelcol_processor_tail_sampling_sampling_policy_evaluation_error` (it's
+  already in Prometheus).
+- **Grafana has no Jaeger datasource.** Jaeger 2.21 serves only its v3 API,
+  which Grafana 13's Jaeger datasource doesn't use. Logs link out to the
+  Jaeger UI, but Grafana can't show traces itself. **Depends** on Grafana
+  catching up, or on adding Tempo.
+- **`service.version` comes from the telemetry crate,** not each binary. It's
+  correct here only because the workspace shares one version. **Fix:** pass
+  the version from each `main`.
+- **`span.duration` isn't a standard name** and has no namespace. **Fix,
+  cheaply:** rename to something like `tracing.span.duration`.
+
 ## Overall assessment
 
 You're right that the industry moved, but it moved in a particular direction.
@@ -443,28 +567,40 @@ What still holds up from the original idea:
 - **Metrics that don't depend on sampling.** Correct, and it matches best
   practice.
 
-Where the design should give ground:
+Where the design gave ground, and it was worth it:
 
-- **Output formats should be OTel's,** not ours: semconv names, OTLP logs,
-  `OTEL_*` env vars, baggage. These are cheap and connect the project to every
-  off-the-shelf dashboard and backend.
-- **Stop treating span events as the log store** once OTLP logs exist.
-- **Sampling needs production hardening:** explicit `AlwaysOn`, and two
-  collector tiers.
+- **Output formats are OTel's now:** semconv span and metric names, OTLP logs,
+  `OTEL_*` env vars, baggage. Standard dashboards and backends understand the
+  data without any mapping.
+- **Span events are no longer the log store.** Logs are their own signal, and
+  span events are a level-gated extra on top.
+- **Sampling is hardened:** explicit `AlwaysOn`, decision timing tuned,
+  decisions remembered, and "always keep errors" checked against unsampled
+  logs.
 
-In short: keep `tracing` as the way the code is written, make the output fully
-OTel-conformant, and let the Collector be the one place for sampling
-decisions. That combines the part of the original design that holds up with
-what the industry has standardised since.
+What it cost:
 
-### If I were to do the next pass, in order
+- **More glue:** the telemetry crate has five layers, an export guard and an
+  integer-type workaround.
+- **More containers:** six infrastructure containers where there were four.
+- **New sharp edges:** items 17–23. The most important is item 17, where
+  "always keep errors" now has a stated exception for client-side 4xx.
 
-1. `AlwaysOn` sampler plus the baggage propagator (item 10, item 13). Minutes
-   of work, and it fixes a real correctness gap.
-2. Semconv attributes and status rules on HTTP and DB spans (item 8).
-3. Rename span-derived metrics to semconv instruments (item 3).
-4. `opentelemetry-appender-tracing` for OTLP logs, and limit span events in
-   prod (items 1–2).
-5. `OTEL_*` env var precedence (item 11).
-6. Two-tier collector and exemplars when it's heading to real traffic (items
-   5, 9).
+In short: keep `tracing` as the way the code is written, keep the output
+OTel-conformant, and let the Collector make the sampling decision. The core
+idea holds. One instrumentation API, where levels control cost and detail and
+can be changed at runtime, still has no real equivalent elsewhere.
+
+### Next pass, in order
+
+1. **Metrics chosen by span kind as well as level (item 18).** Small change,
+   and it removes a silent failure.
+2. **Test that all three signals agree on errors (item 19).** Protects the
+   "everything comes from one source" claim.
+3. **Alert on OTTL evaluation errors, and make the client-4xx exclusion
+   configurable (items 17 and 23).**
+4. **`sampling.keep` span field (item 20).** Lets code influence sampling in
+   `tracing` terms.
+5. **Small fixes:** per-binary `service.version`, rename `span.duration`, and
+   benchmark the bridge (item 15).
+6. **Before real traffic:** two-tier collector and exemplars (items 5 and 9).
